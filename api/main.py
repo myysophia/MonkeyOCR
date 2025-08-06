@@ -14,14 +14,27 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tempfile import gettempdir
 import zipfile
 from loguru import logger
 import time
+import base64
 
 from magic_pdf.model.custom_model import MonkeyOCR
 import uvicorn
+
+# Request models for file_content interfaces
+class FileContentRequest(BaseModel):
+    file_content: str = Field(..., description="Base64 encoded file content")
+    filename: Optional[str] = Field(None, description="Original filename with extension")
+    file_type: Optional[str] = Field(None, description="File type (pdf, jpg, jpeg, png)")
+
+class ParseFileContentRequest(BaseModel):
+    file_content: str = Field(..., description="Base64 encoded file content")
+    filename: Optional[str] = Field(None, description="Original filename with extension")
+    file_type: Optional[str] = Field(None, description="File type (pdf, jpg, jpeg, png)")
+    split_pages: bool = Field(False, description="Whether to split result by pages")
 
 # Response models
 class TaskResponse(BaseModel):
@@ -223,6 +236,33 @@ async def parse_document(file: UploadFile = File(...)):
 async def parse_document_split(file: UploadFile = File(...)):
     """Parse complete document and split result by pages (PDF or image)"""
     return await parse_document_internal(file, split_pages=True)
+
+# New file_content based interfaces
+@app.post("/ocr/text/content", response_model=TaskResponse)
+async def extract_text_from_content(request: FileContentRequest):
+    """Extract text from base64 encoded file content"""
+    return await perform_ocr_task_from_content(request, "text")
+
+@app.post("/ocr/formula/content", response_model=TaskResponse)
+async def extract_formula_from_content(request: FileContentRequest):
+    """Extract formulas from base64 encoded file content"""
+    return await perform_ocr_task_from_content(request, "formula")
+
+@app.post("/ocr/table/content", response_model=TaskResponse)
+async def extract_table_from_content(request: FileContentRequest):
+    """Extract tables from base64 encoded file content"""
+    return await perform_ocr_task_from_content(request, "table")
+
+@app.post("/parse/content", response_model=ParseResponse)
+async def parse_document_from_content(request: ParseFileContentRequest):
+    """Parse complete document from base64 encoded file content"""
+    return await parse_document_from_content_internal(request)
+
+@app.post("/parse/split/content", response_model=ParseResponse)
+async def parse_document_split_from_content(request: ParseFileContentRequest):
+    """Parse complete document from base64 encoded file content and split result by pages"""
+    request.split_pages = True
+    return await parse_document_from_content_internal(request)
 
 async def async_parse_file(input_file_path: str, output_dir: str, split_pages: bool = False):
     """
@@ -659,6 +699,188 @@ async def create_zip_file_async(result_dir, zip_path, original_name, split_pages
     
     # Run ZIP creation in thread pool to avoid blocking
     await asyncio.get_event_loop().run_in_executor(None, create_zip_sync)
+
+def validate_file_content_request(request, allowed_extensions=None):
+    """Validate file content request and determine file extension"""
+    if allowed_extensions is None:
+        allowed_extensions = {'.pdf', '.jpg', '.jpeg', '.png'}
+    
+    # Determine file extension
+    file_ext = None
+    if request.file_type:
+        file_ext = f".{request.file_type.lower()}"
+    elif request.filename:
+        file_ext = Path(request.filename).suffix.lower()
+    else:
+        # Try to detect from base64 content (basic detection)
+        try:
+            decoded_content = base64.b64decode(request.file_content[:100])  # Check first 100 chars
+            if decoded_content.startswith(b'%PDF'):
+                file_ext = '.pdf'
+            elif decoded_content.startswith(b'\xff\xd8\xff'):
+                file_ext = '.jpg'
+            elif decoded_content.startswith(b'\x89PNG'):
+                file_ext = '.png'
+        except Exception:
+            pass
+    
+    if not file_ext or file_ext not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot determine file type or unsupported file type. Allowed: {', '.join(allowed_extensions)}. Please provide filename or file_type."
+        )
+    
+    return file_ext
+
+def decode_file_content(file_content: str) -> bytes:
+    """Decode base64 file content"""
+    try:
+        return base64.b64decode(file_content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 content: {str(e)}")
+
+async def perform_ocr_task_from_content(request: FileContentRequest, task_type: str) -> TaskResponse:
+    """Perform OCR task from base64 file content"""
+    try:
+        if not monkey_ocr_model:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        # Validate and get file extension
+        file_ext = validate_file_content_request(request)
+        
+        # Decode base64 content
+        file_content_bytes = decode_file_content(request.file_content)
+        
+        # Generate filename if not provided
+        if request.filename:
+            original_name = '.'.join(request.filename.split('.')[:-1])
+        else:
+            original_name = f"document_{task_type}"
+        
+        # Save file content temporarily with unique name
+        import uuid
+        unique_suffix = str(uuid.uuid4())[:8]
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext, prefix=f"ocr_content_{unique_suffix}_") as temp_file:
+            temp_file.write(file_content_bytes)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Create output directory with unique name
+            output_dir = tempfile.mkdtemp(prefix=f"monkeyocr_{task_type}_content_{unique_suffix}_")
+            
+            # Use optimized async single task recognition
+            result_dir = await async_single_task_recognition(temp_file_path, output_dir, task_type)
+            
+            # Read result file
+            def read_result_sync():
+                result_files = [f for f in os.listdir(result_dir) if f.endswith(f'_{task_type}_result.md')]
+                if not result_files:
+                    raise Exception("No result file generated")
+                
+                result_file_path = os.path.join(result_dir, result_files[0])
+                with open(result_file_path, 'r', encoding='utf-8') as f:
+                    return f.read()
+            
+            content = await asyncio.get_event_loop().run_in_executor(None, read_result_sync)
+            
+            return TaskResponse(
+                success=True,
+                task_type=task_type,
+                content=content,
+                message=f"{task_type.capitalize()} extraction from file content completed successfully"
+            )
+            
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(temp_file_path)
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup temp file {temp_file_path}: {cleanup_error}")
+            
+    except Exception as e:
+        logger.error(f"OCR task from content failed: {str(e)}")
+        return TaskResponse(
+            success=False,
+            task_type=task_type,
+            content="",
+            message=f"OCR task from content failed: {str(e)}"
+        )
+
+async def parse_document_from_content_internal(request: ParseFileContentRequest):
+    """Internal function to parse document from base64 content"""
+    try:
+        if not monkey_ocr_model:
+            raise HTTPException(status_code=500, detail="Model not initialized")
+        
+        # Validate and get file extension
+        file_ext = validate_file_content_request(request)
+        
+        # Decode base64 content
+        file_content_bytes = decode_file_content(request.file_content)
+        
+        # Generate filename if not provided
+        if request.filename:
+            original_name = '.'.join(request.filename.split('.')[:-1])
+        else:
+            original_name = "document_parsed"
+        
+        # Save file content temporarily with unique name
+        import uuid
+        unique_suffix = str(uuid.uuid4())[:8]
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext, prefix=f"parse_content_{unique_suffix}_") as temp_file:
+            temp_file.write(file_content_bytes)
+            temp_file_path = temp_file.name
+        
+        try:
+            # Create output directory with unique name
+            output_dir = tempfile.mkdtemp(prefix=f"monkeyocr_parse_content_{unique_suffix}_")
+            
+            # Use optimized async parse function
+            result_dir = await async_parse_file(temp_file_path, output_dir, request.split_pages)
+            
+            # List generated files
+            files = []
+            if os.path.exists(result_dir):
+                for root, dirs, filenames in os.walk(result_dir):
+                    for filename in filenames:
+                        rel_path = os.path.relpath(os.path.join(root, filename), result_dir)
+                        files.append(rel_path)
+            
+            # Create download URL with original filename and timestamp
+            suffix = "_split" if request.split_pages else "_parsed"
+            timestamp = int(time.time() * 1000)
+            zip_filename = f"{original_name}{suffix}_content_{timestamp}_{unique_suffix}.zip"
+            zip_path = os.path.join(temp_dir, zip_filename)
+            
+            # Create ZIP file asynchronously
+            await create_zip_file_async(result_dir, zip_path, original_name, request.split_pages)
+            
+            download_url = f"/static/{zip_filename}"
+            
+            # Determine file type for response message
+            file_type = "PDF" if file_ext == '.pdf' else "image"
+            parse_type = "with page splitting" if request.split_pages else "standard"
+            
+            return ParseResponse(
+                success=True,
+                message=f"{file_type} parsing from content ({parse_type}) completed successfully",
+                output_dir=result_dir,
+                files=files,
+                download_url=download_url
+            )
+            
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(temp_file_path)
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup temp file {temp_file_path}: {cleanup_error}")
+            
+    except Exception as e:
+        logger.error(f"Parsing from content failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Parsing from content failed: {str(e)}")
 
 async def perform_ocr_task(file: UploadFile, task_type: str) -> TaskResponse:
     """Perform OCR task on uploaded file"""
