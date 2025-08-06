@@ -32,7 +32,12 @@ WORKDIR /app/MonkeyOCR
 RUN pip install -e .
 
 # Install inference backend dependencies
-RUN pip install lmdeploy==0.8.0
+#RUN pip install lmdeploy==0.8.0
+
+# Add vLLM installation with --system flag  
+RUN pip install uv --upgrade  
+ARG CUDA_VERSION=126  
+RUN uv pip install vllm==0.9.1 --torch-backend=cu${CUDA_VERSION} --system
 
 # Install model download related dependencies
 RUN pip install modelscope huggingface_hub
